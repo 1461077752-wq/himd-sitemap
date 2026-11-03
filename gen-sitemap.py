@@ -10,7 +10,7 @@ himd.com sitemap 生成器（替换原 incremental_sitemap_update.py）
 sitemap_bd_s_37.xml 的区块顺序：
   1. 首页
   2. 各分类页（categories.status = 1 且 type<>3，未被 Astro 页覆盖；空分类不收）
-  3. Astro 已发布页（读 --astro-sitemap 的 sitemap-astro.xml；缺失时跳过本文件）
+  3. Astro 已发布页（读服务器 nginx 的 location = /slug alias，即线上实际直出清单）
   4. 健康热点 /health-discover 论文解读（categories.id = 391）
   5. 健康新闻 /health-news（categories.id = 392）
   6. 科普文章 /article（categories.id = 394，按日期倒序补足到 40,000 条）
@@ -22,16 +22,12 @@ sitemap_bd_s_37.xml 的区块顺序：
 站点：www.himd.com（CMS 站），m.himd.com（移动同站）。Astro 页由 nginx alias 直出。
 
 sitemap_bd_s_37.xml 的 Astro 输入：
-  本机在 himd-astro 下跑 astro build && node scripts/gen-sitemap-astro.mjs，
-  把 dist/sitemap-astro.xml 传到服务器 /tmp/sitemap-astro.xml 后再执行本脚本；
-  未传时跳过 sitemap_bd_s_37.xml，不覆盖线上现有文件（避免用 46 条 alias 写小 137 条）。
+  Astro 段以服务器 nginx 的 alias 为准（当前 43 条），不依赖本地 himd-astro 构建，
+  换机器也能直接跑。若服务器上存在 /tmp/sitemap-astro.xml，只用它覆盖同 slug 的
+  lastmod（更准），缺失或解析失败都不影响出文件。
 
 本文件只存本地仓库（deploy/），不在服务器留副本、不进宝塔计划任务。
 运行时把脚本经 ssh 喂给远端 python，源文件不落盘：
-
-  # 先传 Astro sitemap（sitemap_bd_s_37.xml 的输入）
-  scp -i ~/.ssh/himd_old_deploy_ed25519 himd-astro/dist/sitemap-astro.xml \
-      root@47.100.54.41:/tmp/sitemap-astro.xml
 
   # 预演（只写服务器 /tmp，不动线上文件）
   ssh -i ~/.ssh/himd_old_deploy_ed25519 root@47.100.54.41 \
@@ -62,6 +58,7 @@ MOBILE = "https://m.himd.com"
 
 ASTRO_CONFS = [
     "/www/server/panel/vhost/nginx/extension/himd_com/himd-diseases.conf",
+    "/www/server/panel/vhost/nginx/extension/himd_com/himd-drug-osimertinib.conf",
     "/www/server/panel/vhost/rewrite/go_himd_com.conf",
 ]
 
@@ -206,13 +203,20 @@ def load_category_articles(cid, prefix, limit=None):
 
 
 def load_astro_xml(path):
-    """读 Astro 构建产物 sitemap-astro.xml，返回 [(path, lastmod)]。"""
+    """可选：读 Astro 构建产物 sitemap-astro.xml，返回 [(path, lastmod)]。
+
+    仅用于给 nginx alias 清单覆盖 lastmod，缺失/损坏都返回空列表。
+    """
     if not path or not os.path.exists(path):
         return []
     import xml.etree.ElementTree as ET
 
     ns = "{http://www.sitemaps.org/schemas/sitemap/0.9}"
-    root = ET.parse(path).getroot()
+    try:
+        root = ET.parse(path).getroot()
+    except Exception as exc:
+        print("warn: %s 解析失败（%s），按 alias mtime 取 lastmod" % (path, exc))
+        return []
     out, seen = [], set()
     for url in root.findall(ns + "url"):
         loc = (url.findtext(ns + "loc") or "").strip()
@@ -245,14 +249,28 @@ def render_xml_mobile(entries, base=MOBILE):
     return "\n".join(parts) + "\n"
 
 
-def build_m_quality_entries(astro_path, target):
-    """按 首页 → 分类 → Astro → 论文解读 → 健康新闻 → 科普文章 组装，截断到 target。"""
-    astro = load_astro_xml(astro_path)
+def build_m_quality_entries(astro_xml_path, target):
+    """按 首页 → 分类 → Astro → 论文解读 → 健康新闻 → 科普文章 组装，截断到 target。
+
+    Astro 段以服务器 nginx 的 location = /slug 为准（线上实际直出页）；
+    sitemap-astro.xml 只用于覆盖同 slug 的 lastmod，不是必需输入。
+    """
+    astro = load_astro_pages()
     if not astro:
-        # 不要退回 nginx alias：alias 只有 46 条，会把线上 137 条的 Astro 区块写小。
-        print("warn: %s 缺失或为空，跳过 sitemap_bd_s_37.xml" % astro_path)
-        return None, {}
-    astro_paths = set(p for p, _ in astro)
+        print("warn: 未从 nginx 配置读到 Astro 页面，Astro 段为空")
+    else:
+        overlay = dict(load_astro_xml(astro_xml_path))
+        overlaid = 0
+        merged_astro = []
+        for path, lastmod, cf, pr in astro:
+            if overlay.get(path):
+                lastmod = overlay[path]
+                overlaid += 1
+            merged_astro.append((path, lastmod, cf, pr))
+        astro = merged_astro
+        if overlaid:
+            print("info: %d 条 Astro lastmod 取自 %s" % (overlaid, astro_xml_path))
+    astro_paths = set(p for p, *_ in astro)
 
     home = [("/", day(time.time()))]
     cats = [c for c in load_m_categories() if c[0] not in astro_paths]
@@ -268,7 +286,7 @@ def build_m_quality_entries(astro_path, target):
     sections = [
         ("home", home),
         ("categories", [(p, d) for p, d, _ in cats]),
-        ("astro", astro),
+        ("astro", [(p, d) for p, d, *_ in astro]),
         ("papers", [(p, d) for p, d, _ in papers]),
         ("news", [(p, d) for p, d, _ in news]),
     ]
@@ -365,7 +383,7 @@ def main():
     ap.add_argument("--max-urls", type=int, default=MAX_URLS, help="单文件条数上限，默认 40000")
     ap.add_argument("--m-target", type=int, default=40000, help="sitemap_bd_s_37.xml 目标条数")
     ap.add_argument("--astro-sitemap", default="/tmp/sitemap-astro.xml",
-                    help="himd-astro/dist/sitemap-astro.xml 上传到服务器的路径")
+                    help="可选：用 himd-astro 构建产物覆盖同 slug 的 lastmod；缺失不影响生成")
     ap.add_argument("--out-dir", default="/tmp/sitemap-preview")
     args = ap.parse_args()
     if args.m_target <= 0 or args.m_target > MAX_URLS:
