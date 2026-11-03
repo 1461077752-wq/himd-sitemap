@@ -3,20 +3,35 @@
 """
 himd.com sitemap 生成器（替换原 incremental_sitemap_update.py）
 
-输出顺序（重要度优先，超出上限时从尾部截断）：
-  1. 首页
-  2. 各分类页（categories.status = 1）
-  3. Astro 页面（以 nginx 实际 alias 的 = /slug 精准匹配为准，只收上线中的）
-  4. 旧内容：archives 按 id 倒序（最新在前）
-
-产物（/www/wwwroot/himd.com/public/）：
+输出：
   sitemap.xml / baidu-sitemap.xml / m-sitemap.xml / m-baidu-sitemap.xml / sitemap.txt / m-sitemap.txt
+  sitemap_bd_s_37.xml（m 站高质量版，40,000 条，按下面的区块顺序从尾部截断）
+
+sitemap_bd_s_37.xml 的区块顺序：
+  1. 首页
+  2. 各分类页（categories.status = 1 且 type<>3，未被 Astro 页覆盖；空分类不收）
+  3. Astro 已发布页（读 --astro-sitemap 的 sitemap-astro.xml；缺失时跳过本文件）
+  4. 健康热点 /health-discover 论文解读（categories.id = 391）
+  5. 健康新闻 /health-news（categories.id = 392）
+  6. 科普文章 /article（categories.id = 394，按日期倒序补足到 40,000 条）
+
+其余 6 个文件的旧逻辑不变：
+  首页 → 各分类页 → Astro 页 → archives 按 id 倒序。
 
 限制：单文件 ≤ 50000 条，且 ≤ 10MB（百度规则，按 UTF-8 字节数控制在 9.9MB 以内）。
 站点：www.himd.com（CMS 站），m.himd.com（移动同站）。Astro 页由 nginx alias 直出。
 
+sitemap_bd_s_37.xml 的 Astro 输入：
+  本机在 himd-astro 下跑 astro build && node scripts/gen-sitemap-astro.mjs，
+  把 dist/sitemap-astro.xml 传到服务器 /tmp/sitemap-astro.xml 后再执行本脚本；
+  未传时跳过 sitemap_bd_s_37.xml，不覆盖线上现有文件（避免用 46 条 alias 写小 137 条）。
+
 本文件只存本地仓库（deploy/），不在服务器留副本、不进宝塔计划任务。
 运行时把脚本经 ssh 喂给远端 python，源文件不落盘：
+
+  # 先传 Astro sitemap（sitemap_bd_s_37.xml 的输入）
+  scp -i ~/.ssh/himd_old_deploy_ed25519 himd-astro/dist/sitemap-astro.xml \
+      root@47.100.54.41:/tmp/sitemap-astro.xml
 
   # 预演（只写服务器 /tmp，不动线上文件）
   ssh -i ~/.ssh/himd_old_deploy_ed25519 root@47.100.54.41 \
@@ -145,6 +160,150 @@ def load_astro_pages():
     return [("/" + slug, lastmod, "monthly", "0.9") for slug, lastmod in sorted(pages.items())]
 
 
+def load_m_categories():
+    """m 站分类区块：只收有时间的分类页；无时间的用该分类最新文章时间兜底。
+
+    返回 [(path, lastmod, id)]，已按 id 升序。
+    """
+    rows = mysql_rows(
+        "SELECT c.id, c.url_token, "
+        "COALESCE(NULLIF(c.updated_time,0), c.created_time, f.ts) "
+        "FROM categories c "
+        "LEFT JOIN ("
+        "  SELECT a.category_id, MAX(COALESCE(NULLIF(a.updated_time,0), a.created_time)) ts "
+        "  FROM archives a "
+        "  WHERE a.category_id IN ("
+        "    SELECT id FROM categories WHERE status=1 AND type<>3 "
+        "    AND COALESCE(NULLIF(updated_time,0), created_time) IS NULL"
+        "  ) GROUP BY a.category_id"
+        ") f ON f.category_id=c.id "
+        "WHERE c.status=1 AND c.type<>3 ORDER BY c.id ASC"
+    )
+    out = []
+    for cid, token, ts in rows:
+        token = token.rstrip("/")
+        lastmod = pick_day(ts)
+        if not token.strip() or not lastmod:
+            continue
+        out.append((quote("/" + token, safe="/"), lastmod, int(cid)))
+    return out
+
+
+def load_category_articles(cid, prefix, limit=None):
+    """按分类取文章页：优先 fixed_link，否则 /<prefix>/<id>；按日期倒序。"""
+    sql = (
+        "SELECT id, COALESCE(NULLIF(updated_time,0), created_time), "
+        "COALESCE(fixed_link, '') FROM archives WHERE category_id=%d "
+        "ORDER BY 2 DESC, id DESC" % int(cid)
+    )
+    if limit:
+        sql += " LIMIT %d" % int(limit)
+    out = []
+    for aid, ts, fixed in mysql_rows(sql):
+        path = fixed if fixed.startswith("/") else "/%s/%s" % (prefix, aid)
+        out.append((path, pick_day(ts), int(aid)))
+    return out
+
+
+def load_astro_xml(path):
+    """读 Astro 构建产物 sitemap-astro.xml，返回 [(path, lastmod)]。"""
+    if not path or not os.path.exists(path):
+        return []
+    import xml.etree.ElementTree as ET
+
+    ns = "{http://www.sitemaps.org/schemas/sitemap/0.9}"
+    root = ET.parse(path).getroot()
+    out, seen = [], set()
+    for url in root.findall(ns + "url"):
+        loc = (url.findtext(ns + "loc") or "").strip()
+        lastmod = (url.findtext(ns + "lastmod") or "").strip()[:10]
+        if not loc.startswith(WWW + "/"):
+            continue
+        path = loc[len(WWW):]
+        if path in seen:
+            continue
+        seen.add(path)
+        out.append((path, lastmod))
+    return out
+
+
+def render_xml_mobile(entries, base=MOBILE):
+    """sitemap_bd_s_37.xml 的最小格式：loc + mobile:mobile + lastmod。"""
+    parts = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"'
+        ' xmlns:mobile="http://www.baidu.com/schemas/sitemap-mobile/1/">',
+    ]
+    for path, lastmod in entries:
+        parts.append("<url>")
+        parts.append("  <loc>%s%s</loc>" % (base, path))
+        parts.append('  <mobile:mobile type="mobile"/>')
+        if lastmod:
+            parts.append("  <lastmod>%s</lastmod>" % lastmod)
+        parts.append("</url>")
+    parts.append("</urlset>")
+    return "\n".join(parts) + "\n"
+
+
+def build_m_quality_entries(astro_path, target):
+    """按 首页 → 分类 → Astro → 论文解读 → 健康新闻 → 科普文章 组装，截断到 target。"""
+    astro = load_astro_xml(astro_path)
+    if not astro:
+        # 不要退回 nginx alias：alias 只有 46 条，会把线上 137 条的 Astro 区块写小。
+        print("warn: %s 缺失或为空，跳过 sitemap_bd_s_37.xml" % astro_path)
+        return None, {}
+    astro_paths = set(p for p, _ in astro)
+
+    home = [("/", day(time.time()))]
+    cats = [c for c in load_m_categories() if c[0] not in astro_paths]
+    cats.sort(key=lambda x: x[2])
+    cats.sort(key=lambda x: x[1] or "0000-00-00", reverse=True)
+    astro.sort(key=lambda x: x[0])
+    astro.sort(key=lambda x: x[1] or "0000-00-00", reverse=True)
+    papers = load_category_articles(391, "health-discover")
+    news = load_category_articles(392, "health-news")
+    papers.sort(key=lambda x: (x[1] or "0000-00-00", x[2]), reverse=True)
+    news.sort(key=lambda x: (x[1] or "0000-00-00", x[2]), reverse=True)
+
+    sections = [
+        ("home", home),
+        ("categories", [(p, d) for p, d, _ in cats]),
+        ("astro", astro),
+        ("papers", [(p, d) for p, d, _ in papers]),
+        ("news", [(p, d) for p, d, _ in news]),
+    ]
+    entries, seen, counts = [], set(), {}
+    for name, group in sections:
+        n = 0
+        for path, lastmod in group:
+            if len(entries) >= target:
+                break
+            if path in seen:
+                continue
+            seen.add(path)
+            entries.append((path, lastmod))
+            n += 1
+        counts[name] = n
+
+    remaining = target - len(entries)
+    if remaining > 0:
+        popular = load_category_articles(394, "article", limit=remaining + 50)
+        popular.sort(key=lambda x: (x[1] or "0000-00-00", x[2]), reverse=True)
+        n = 0
+        for path, lastmod, _ in popular:
+            if len(entries) >= target:
+                break
+            if path in seen:
+                continue
+            seen.add(path)
+            entries.append((path, lastmod))
+            n += 1
+        counts["popular"] = n
+    else:
+        counts["popular"] = 0
+    return entries, counts
+
+
 def render_xml(entries, base, baidu):
     parts = [
         '<?xml version="1.0" encoding="UTF-8"?>',
@@ -204,8 +363,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--max-urls", type=int, default=MAX_URLS, help="单文件条数上限，默认 40000")
+    ap.add_argument("--m-target", type=int, default=40000, help="sitemap_bd_s_37.xml 目标条数")
+    ap.add_argument("--astro-sitemap", default="/tmp/sitemap-astro.xml",
+                    help="himd-astro/dist/sitemap-astro.xml 上传到服务器的路径")
     ap.add_argument("--out-dir", default="/tmp/sitemap-preview")
     args = ap.parse_args()
+    if args.m_target <= 0 or args.m_target > MAX_URLS:
+        ap.error("--m-target must be 1..%d" % MAX_URLS)
 
     cats, token_map = load_categories()
     astro = load_astro_pages()
@@ -267,9 +431,20 @@ def main():
         write_atomic(os.path.join(out_dir, name), txt, mode=0o755)
         stats.append((name, len(kept), len(txt.encode("utf-8"))))
 
+    m_entries, m_counts = build_m_quality_entries(args.astro_sitemap, args.m_target)
+    if m_entries is not None:
+        m_kept = fit(m_entries, render_xml_mobile, max_urls=args.m_target)
+        m_xml = render_xml_mobile(m_kept)
+        write_atomic(os.path.join(out_dir, "sitemap_bd_s_37.xml"), m_xml, mode=0o644)
+        stats.append(("sitemap_bd_s_37.xml", len(m_kept), len(m_xml.encode("utf-8"))))
+
     print("output: %s %s" % (out_dir, "(dry-run)" if args.dry_run else ""))
     print("sections: home=%d categories=%d (其中线上 Astro 覆盖 %d) astro_only=%d archives=%d"
           % (len(home), len(sections[0][1]), merged, len(sections[1][1]), len(archives)))
+    if m_entries is not None:
+        print("m quality: home=%d categories=%d astro=%d papers=%d news=%d popular=%d target=%d"
+              % (m_counts["home"], m_counts["categories"], m_counts["astro"],
+                 m_counts["papers"], m_counts["news"], m_counts["popular"], args.m_target))
     for name, count, size in stats:
         print("  %-20s %6d 条  %8.2f MB" % (name, count, size / 1048576.0))
     return 0
