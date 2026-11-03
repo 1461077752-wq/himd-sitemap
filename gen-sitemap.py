@@ -55,6 +55,8 @@ PUBLIC_DIR = os.path.join(SITE_ROOT, "public")
 CONFIG_FILE = os.path.join(SITE_ROOT, "config.json")
 WWW = "https://www.himd.com"
 MOBILE = "https://m.himd.com"
+# sitemap_bd_s_37.xml 的第二落点（百度推送工具目录，不对外服务，保持与 public 同步）
+MIRROR_BD = "/server/nginx/bdsitemap/m/sitemap_bd_s_37.xml"
 
 ASTRO_CONFS = [
     "/www/server/panel/vhost/nginx/extension/himd_com/himd-diseases.conf",
@@ -406,7 +408,8 @@ def main():
 
     cats, token_map = load_categories()
     astro = load_astro_pages()
-    home = [("", day(time.time()), "always", "1.0")]
+    # 首页 loc 带尾斜杠，与线上 canonical（https://www.himd.com/）同一形态
+    home = [("/", day(time.time()), "always", "1.0")]
 
     # 同一个 slug 只出现一次：Astro 页在线上覆盖同名分类页，lastmod 以 Astro 为准，
     # 但仍排在分类区块，保证"分类 → Astro → 旧内容"的顺序不变。
@@ -470,6 +473,9 @@ def main():
         m_xml = render_xml_mobile(m_kept)
         write_atomic(os.path.join(out_dir, "sitemap_bd_s_37.xml"), m_xml, mode=0o644)
         stats.append(("sitemap_bd_s_37.xml", len(m_kept), len(m_xml.encode("utf-8"))))
+        # 镜像目录只在正式跑时同步（dry-run 不碰）
+        if not args.dry_run and os.path.isdir(os.path.dirname(MIRROR_BD)):
+            write_atomic(MIRROR_BD, m_xml, mode=0o644)
 
     print("output: %s %s" % (out_dir, "(dry-run)" if args.dry_run else ""))
     print("sections: home=%d categories=%d (其中线上 Astro 覆盖 %d) astro_only=%d archives=%d"
