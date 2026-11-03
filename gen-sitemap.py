@@ -105,12 +105,27 @@ def pick_day(*stamps):
 
 
 def load_categories():
-    """分类页 + 归档 URL 所需的 token 映射。"""
+    """分类页 + 归档 URL 所需的 token 映射。
+
+    lastmod：分类自身 updated/created 优先，缺失时用该分类最新文章时间兜底，
+    与 load_m_categories 同规则（避免同一分类在旧 6 件套里没日期）。
+    """
     rows = mysql_rows(
-        "SELECT id, url_token, updated_time, created_time, status FROM categories ORDER BY id ASC"
+        "SELECT c.id, c.url_token, c.status, "
+        "COALESCE(NULLIF(c.updated_time,0), c.created_time, f.ts) "
+        "FROM categories c "
+        "LEFT JOIN ("
+        "  SELECT a.category_id, MAX(COALESCE(NULLIF(a.updated_time,0), a.created_time)) ts "
+        "  FROM archives a "
+        "  WHERE a.category_id IN ("
+        "    SELECT id FROM categories WHERE status=1 AND type<>3 "
+        "    AND COALESCE(NULLIF(updated_time,0), created_time) IS NULL"
+        "  ) GROUP BY a.category_id"
+        ") f ON f.category_id=c.id "
+        "ORDER BY c.id ASC"
     )
     cats, token_map = [], {}
-    for cid, token, updated, created, status in rows:
+    for cid, token, status, ts in rows:
         token = token.rstrip("/")
         if not token.strip():
             continue
@@ -118,7 +133,7 @@ def load_categories():
         # 不能 strip，只能按 URL 规则编码。
         token_map[int(cid)] = token
         if status == "1":
-            cats.append((quote("/" + token, safe="/"), pick_day(updated, created), "weekly", "0.9"))
+            cats.append((quote("/" + token, safe="/"), pick_day(ts), "weekly", "0.9"))
     return cats, token_map
 
 
