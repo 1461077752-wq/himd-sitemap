@@ -5,13 +5,15 @@ himd.com sitemap 生成器（2026-11-09 版，与百度站长平台槽位一一�
 
 输出 5 个文件：
   www sitemap.xml            首页 + 入口分类 + 最新文章，40000 条封顶（PC 槽 1）
-  www sitemap-diseases.xml   癌症百科 82 条（PC 槽 2）
-  www sitemap-drugs.xml      药品页 220 条（PC 槽 3）
+  www sitemap-diseases.xml   全部内容页：疾病 + 药品 + Astro 直出页（PC 槽 2）
+  www sitemap-drugs.xml      药品页单独一份（PC 槽 3，与槽 2 重复，留作备用）
   www sitemap-services.xml   服务页 3 条：/recruitment/ /consult /medicine-guide（PC 槽 4）
   m   sitemap_bd_s_37.xml    m 站唯一槽位：首页+服务+分类+Astro+论文+新闻+科普，40000 条封顶
 
 百度规则：不支持索引型 sitemap；单文件 ≤ 50000 条且 < 10MB；URL 必须属于已验证主域。
-疾病/药品/服务各自成文件，避免 82 个百科页淹没在 4 万条文章里，也便于按文件看抓取/索引数据。
+站点只提交 sitemap.xml 和 sitemap-diseases.xml，所以槽 2 承载全部内容页，按 slug 去重；
+新上线的疾病/药品页由索引 JSON 或 nginx alias 自动进入下一次生成，不需要再改脚本。
+药品/服务另有独立文件，避免全部页面淹在 4 万条文章里，也便于按文件看抓取/索引数据。
 
 lastmod 口径：
   - 疾病 / 药品：读 public/static/himd1/{cancer,drug}-index.json 的 updated（内容更新时间）
@@ -322,16 +324,21 @@ def render_xml(entries, base=WWW):
 
 
 def render_simple(entries, changefreq, base=WWW):
-    """专项 sitemap：loc + lastmod(可选) + changefreq，一行一条。"""
+    """专项 sitemap：loc + lastmod(可选) + changefreq，一行一条。
+
+    条目可以是 (path, lastmod) 或 (path, lastmod, changefreq)，后者优先用自己的频率。
+    """
     parts = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
     ]
-    for path, lastmod in entries:
+    for item in entries:
+        path, lastmod = item[0], item[1]
+        cf = item[2] if len(item) > 2 else changefreq
         line = "<url><loc>%s%s</loc>" % (base, path)
         if lastmod:
             line += "<lastmod>%s</lastmod>" % lastmod
-        line += "<changefreq>%s</changefreq></url>" % changefreq
+        line += "<changefreq>%s</changefreq></url>" % cf
         parts.append(line)
     parts.append("</urlset>")
     return "\n".join(parts) + "\n"
@@ -585,7 +592,16 @@ def main():
     kept = fit(entries, render_xml, max_urls=args.max_urls)
     main_xml = render_xml(kept, WWW)
 
-    diseases_xml = render_simple(diseases, "weekly", WWW)
+    # 槽 2 承载全部内容页：疾病 + 药品 + Astro 直出页，按 slug 去重；
+    # lastmod 取 Astro 段（构建产物 > 索引 JSON > alias mtime），没有 Astro 页的用索引时间
+    disease_paths = set(p for p, _ in diseases)
+    content_lastmod_map = dict((p, lm) for p, lm, _cf, _pr in astro)
+    for path, lastmod in diseases + drugs:
+        content_lastmod_map[path] = content_lastmod_map.get(path) or lastmod
+    content_entries = [(p, content_lastmod_map[p], "weekly" if p in disease_paths else "monthly")
+                       for p in sorted(content_lastmod_map)]
+
+    diseases_xml = render_simple(content_entries, "weekly", WWW)
     drugs_xml = render_simple(drugs, "monthly", WWW)
     services_xml = render_simple(services, "weekly", WWW)
 
@@ -604,7 +620,8 @@ def main():
     errors = []
     errors += verify("sitemap.xml", main_xml, WWW, minimum=30000, must_contain=["/"], forbidden=special)
     errors += verify("sitemap-diseases.xml", diseases_xml, WWW,
-                     expected=len(diseases), minimum=MIN_DISEASES, must_contain=["/breast-cancer"])
+                     expected=len(content_entries), minimum=MIN_DISEASES + MIN_DRUGS,
+                     must_contain=["/breast-cancer", "/osimertinib"])
     errors += verify("sitemap-drugs.xml", drugs_xml, WWW,
                      expected=len(drugs), minimum=MIN_DRUGS, must_contain=["/osimertinib"])
     errors += verify("sitemap-services.xml", services_xml, WWW,
@@ -614,6 +631,10 @@ def main():
 
     print("main: home=%d categories=%d (Astro 覆盖 %d) astro_only=%d archives=%d → %d 条"
           % (len(home), len(sections[0][1]), merged, len(sections[1][1]), len(archives), len(kept)))
+    print("content: diseases=%d drugs=%d astro_extra=%d → %d 条"
+          % (len(diseases), len(drugs),
+             len(content_entries) - len(disease_paths | set(p for p, _ in drugs)),
+             len(content_entries)))
     print("m quality: home=%d services=%d categories=%d astro=%d papers=%d news=%d popular=%d target=%d"
           % (m_counts["home"], m_counts["services"], m_counts["categories"], m_counts["astro"],
              m_counts["papers"], m_counts["news"], m_counts["popular"], args.m_target))
